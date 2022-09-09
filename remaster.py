@@ -12,6 +12,7 @@
    ess@waseda.jp, https://esslab.jp/~ess/
 """
 
+from configparser import Interpolation
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -24,9 +25,12 @@ import os
 import argparse
 import subprocess
 import utils
+import glob
 
 parser = argparse.ArgumentParser(description='Remastering')
 parser.add_argument('--input',   type=str,   default='none', help='Input video')
+parser.add_argument('--input_dir', type=str, default='none', help='Input images')
+parser.add_argument('--half_scale', action='store_true', default=False)
 parser.add_argument('--reference_dir',  type=str, default='none', help='Path to the reference image directory')
 parser.add_argument('--disable_colorization', action='store_true', default=False, help='Remaster without colorization')
 parser.add_argument('--gpu',       action='store_true', default=False, help='Use GPU')
@@ -47,7 +51,12 @@ if not opt.disable_colorization:
    modelC = modelC.to(device)
    modelC.eval()
 
-print('Processing %s...'%os.path.basename(opt.input))
+if opt.input != 'none':
+   print('Processing %s...'%os.path.basename(opt.input))
+elif opt.input_dir != 'none':
+   print('Processing %s...'%os.path.basename(opt.input_dir))
+else:
+   raise ValueError('No input')
 
 outputdir = 'tmp/'
 outputdir_in = outputdir+'input/'
@@ -81,17 +90,31 @@ if not opt.disable_colorization:
       refimgs = refimgs.view(1, refimgs.size(0), refimgs.size(1), refimgs.size(2), refimgs.size(3)).to( device )
 
 # Load video
-cap = cv2.VideoCapture( opt.input )
-nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) # cv2.CAP_PROP_FRAME_COUNT: 7
-v_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-v_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-minwh = min(v_w,v_h)
+if opt.input != 'none':
+   cap = cv2.VideoCapture( opt.input )
+   nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) # cv2.CAP_PROP_FRAME_COUNT: 7
+   v_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+   v_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+elif opt.input_dir != 'none':
+   files = sorted(glob.glob(os.path.join(opt.input_dir, '*/*.png')))
+   nframes = len(files)
+   sample_img = Image.open(files[0])
+   v_w = sample_img.width
+   v_h = sample_img.height
+
+# minwh = min(v_w, v_h)
 scale = 1
-if minwh != opt.mindim:
-   scale = opt.mindim / minwh
-t_w = round(v_w*scale/16.)*16
-t_h = round(v_h*scale/16.)*16
-fps = cap.get(cv2.CAP_PROP_FPS)
+# if minwh != opt.mindim:
+#    scale = opt.mindim / minwh
+if opt.half_scale:
+   t_w = round(v_w*scale/16.)*16/2
+   t_h = round(v_h*scale/16.)*16/2
+else:
+   t_w = round(v_w*scale/16.)*16
+   t_h = round(v_h*scale/16.)*16
+# fps = cap.get(cv2.CAP_PROP_FPS)
+fps = 29.97
 pbar = tqdm(total=nframes)
 block = 5
 
@@ -102,7 +125,8 @@ with torch.no_grad():
       frame_pos = it*block
       if frame_pos >= nframes:
          break
-      cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+      if opt.input != 'none':
+         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
       if block >= nframes-frame_pos:
          proc_g = nframes-frame_pos
       else:
@@ -112,8 +136,11 @@ with torch.no_grad():
       gtC = None
       for i in range(proc_g):
          index = frame_pos + i
-         _, frame = cap.read()
-         frame = cv2.resize(frame, (t_w, t_h))
+         if opt.input != 'none':
+            _, frame = cap.read()
+         elif opt.input_dir != 'none':
+            frame = cv2.imread(files[frame_pos+i])
+         frame = cv2.resize(frame, (t_w, t_h), interpolation=cv2.INTER_LANCZOS4)
          nchannels = frame.shape[2]
          if nchannels == 1 or not opt.disable_colorization:
             frame_l = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -172,15 +199,19 @@ with torch.no_grad():
       pbar.update(proc_g)
    
    # Save result videos
-   outfile = opt.input.split('/')[-1].split('.')[0]
-   cmd = 'ffmpeg -y -r %d -i %s%%07d.png -vcodec libx264 -pix_fmt yuv420p -r %d %s_in.mp4' % (fps, outputdir_in, fps, outfile )
-   subprocess.call( cmd, shell=True )
-   cmd = 'ffmpeg -y -r %d -i %s%%07d.png -vcodec libx264 -pix_fmt yuv420p -r %d %s_out.mp4' % (fps, outputdir_out, fps, outfile )
-   subprocess.call( cmd, shell=True )
-   cmd = 'ffmpeg -y -i %s_in.mp4 -vf "[in] pad=2.01*iw:ih [left];movie=%s_out.mp4[right];[left][right] overlay=main_w/2:0,scale=2*iw/2:2*ih/2[out]" %s_comp.mp4' % ( outfile, outfile, outfile )
-   subprocess.call( cmd, shell=True )
+   # if opt.input != 'none':
+   #    outfile = opt.input.split('/')[-1].split('.')[0]
+   # elif opt.input_dir != 'none':
+   #    outfile = opt.input_dir.split('/')[-1]
+   # cmd = 'ffmpeg -y -r %d -i %s%%07d.png -vcodec libx264 -pix_fmt yuv420p -crf 17 -r %d %s_in.mp4' % (fps, outputdir_in, fps, outfile )
+   # subprocess.call( cmd, shell=True )
+   # cmd = 'ffmpeg -y -r %d -i %s%%07d.png -vcodec libx264 -pix_fmt yuv420p -crf 17 -r %d %s_out.mp4' % (fps, outputdir_out, fps, outfile )
+   # subprocess.call( cmd, shell=True )
+   # cmd = 'ffmpeg -y -i %s_in.mp4 -vf "[in] pad=2.01*iw:ih [left];movie=%s_out.mp4[right];[left][right] overlay=main_w/2:0,scale=2*iw/2:2*ih/2[out]" %s_comp.mp4' % ( outfile, outfile, outfile )
+   # subprocess.call( cmd, shell=True )
 
-   import shutil
-   shutil.rmtree(outputdir)
-   cap.release()
+   # import shutil
+   # shutil.rmtree(outputdir)
+   if opt.input != 'none':
+      cap.release()
    pbar.close()
